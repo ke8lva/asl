@@ -1,0 +1,549 @@
+#!/usr/bin/python3
+
+import argparse
+import logging
+import math
+import os
+import pwd
+import re
+import requests
+import struct
+import subprocess
+import sys
+import tempfile
+
+from datetime import datetime
+from time import sleep
+from urllib.parse import urljoin
+
+_AAN_PAGE_URL = "https://www.arrl.org/arrl-audio-news"
+_FFMPEG = "/usr/bin/ffmpeg"
+
+_SAMPLE_RATE = 8000
+_CW_TONE_HZ = 750
+_FRAME_MS = 20
+
+# Silence expected after the Morse K.
+_MIN_CONFIRM_SILENCE_SECONDS = 3.0
+_MAX_CONFIRM_SILENCE_SECONDS = 5.0
+
+# Adjust if the source contains background hiss.
+_SILENCE_RMS_THRESHOLD = 500
+
+# Tone detection threshold.
+_TONE_RATIO_THRESHOLD = 0.65
+
+# Morse K at 10 WPM, measured in 20 ms frames.
+_DAH_MIN_FRAMES = 7
+_DAH_MAX_FRAMES = 12
+_DIT_MIN_FRAMES = 2
+_DIT_MAX_FRAMES = 5
+_GAP_MIN_FRAMES = 2
+_GAP_MAX_FRAMES = 5
+
+_GAP_SECONDS = 4
+
+def get_aan_url():
+    """Return the URL of the latest ARRL Audio News MP3."""
+    response = requests.get(_AAN_PAGE_URL, timeout=30)
+    response.raise_for_status()
+
+    match = re.search(
+        r'href="([^"]+\.mp3)"',
+        response.text,
+        re.IGNORECASE
+    )
+
+    if not match:
+        raise Exception(f"No MP3 link found on {_AAN_PAGE_URL}")
+
+    return urljoin(_AAN_PAGE_URL, match.group(1))
+
+
+def goertzel_ratio(samples, frequency, sample_rate):
+    """Estimate the proportion of frame energy at a given frequency."""
+    count = len(samples)
+
+    if count < 2:
+        return 0.0
+
+    mean = sum(samples) / count
+    centered = [sample - mean for sample in samples]
+    total_power = sum(sample * sample for sample in centered)
+
+    if total_power < 1:
+        return 0.0
+
+    omega = 2.0 * math.pi * frequency / sample_rate
+    coefficient = 2.0 * math.cos(omega)
+
+    s1 = 0.0
+    s2 = 0.0
+
+    for sample in centered:
+        s0 = sample + coefficient * s1 - s2
+        s2 = s1
+        s1 = s0
+
+    tone_power = (
+        s1 * s1 + s2 * s2 - coefficient * s1 * s2
+    )
+
+    return max(
+        0.0,
+        min(1.0, tone_power / max(1.0, total_power * count / 2))
+    )
+
+
+def merge_short_runs(flags, max_frames=1):
+    """Merge short classification glitches between matching states."""
+    flags = list(flags)
+
+    while True:
+        runs = []
+        start = 0
+
+        for index in range(1, len(flags)):
+            if flags[index] != flags[start]:
+                runs.append((start, index, flags[start]))
+                start = index
+
+        runs.append((start, len(flags), flags[start]))
+        changed = False
+
+        for start, end, state in runs:
+            if (
+                end - start <= max_frames
+                and start > 0
+                and end < len(flags)
+                and flags[start - 1] == flags[end]
+            ):
+                flags[start:end] = [flags[start - 1]] * (end - start)
+                changed = True
+                break
+
+        if not changed:
+            return flags
+
+
+def analyze_audio_frames(pcm, sample_rate, tone_hz):
+    """Classify audio frames and calculate their RMS levels."""
+    frame_samples = sample_rate * _FRAME_MS // 1000
+    frame_bytes = frame_samples * 2
+
+    tone_flags = []
+    rms_values = []
+
+    for offset in range(0, len(pcm) - frame_bytes + 1, frame_bytes):
+        samples = struct.unpack(
+            "<" + "h" * frame_samples,
+            pcm[offset:offset + frame_bytes]
+        )
+
+        mean = sum(samples) / frame_samples
+        centered = [sample - mean for sample in samples]
+        power = sum(sample * sample for sample in centered)
+        rms = math.sqrt(power / frame_samples)
+
+        rms_values.append(rms)
+
+        if rms < _SILENCE_RMS_THRESHOLD:
+            tone_flags.append(False)
+            continue
+
+        ratio = goertzel_ratio(samples, tone_hz, sample_rate)
+        tone_flags.append(ratio >= _TONE_RATIO_THRESHOLD)
+
+    return merge_short_runs(tone_flags), rms_values
+
+
+def get_runs(flags):
+    """Convert Boolean flags into (state, start, end) runs."""
+    if not flags:
+        return []
+
+    runs = []
+    state = flags[0]
+    start = 0
+
+    for index in range(1, len(flags)):
+        if flags[index] != state:
+            runs.append((state, start, index))
+            state = flags[index]
+            start = index
+
+    runs.append((state, start, len(flags)))
+    return runs
+
+
+def find_following_silence(rms_values, start_frame):
+    """Return the end of a confirmed silence, or None."""
+    min_frames = math.ceil(
+        _MIN_CONFIRM_SILENCE_SECONDS * 1000 / _FRAME_MS
+    )
+    max_frames = math.ceil(
+        _MAX_CONFIRM_SILENCE_SECONDS * 1000 / _FRAME_MS
+    )
+
+    search_end = min(len(rms_values), start_frame + max_frames)
+    quiet_start = None
+
+    for index in range(start_frame, search_end):
+        if rms_values[index] < _SILENCE_RMS_THRESHOLD:
+            if quiet_start is None:
+                quiet_start = index
+
+            if index - quiet_start + 1 >= min_frames:
+                return index + 1
+        else:
+            quiet_start = None
+
+    return None
+
+
+def find_morse_ks(pcm, sample_rate, tone_hz, log):
+    """
+    Detect Morse K followed by silence.
+
+    Each result contains start and end sample positions.
+    The end position includes the original silence so that both
+    the K and its following silence are removed from playback.
+    """
+    tone_flags, rms_values = analyze_audio_frames(
+        pcm, sample_rate, tone_hz
+    )
+
+    runs = get_runs(tone_flags)
+    matches = []
+    frame_samples = sample_rate * _FRAME_MS // 1000
+
+    index = 0
+
+    while index <= len(runs) - 5:
+        r1, g1, r2, g2, r3 = runs[index:index + 5]
+
+        if not (
+            r1[0] and not g1[0] and r2[0]
+            and not g2[0] and r3[0]
+        ):
+            index += 1
+            continue
+
+        dah1 = r1[2] - r1[1]
+        gap1 = g1[2] - g1[1]
+        dit = r2[2] - r2[1]
+        gap2 = g2[2] - g2[1]
+        dah2 = r3[2] - r3[1]
+
+        valid = (
+            _DAH_MIN_FRAMES <= dah1 <= _DAH_MAX_FRAMES
+            and _DIT_MIN_FRAMES <= dit <= _DIT_MAX_FRAMES
+            and _DAH_MIN_FRAMES <= dah2 <= _DAH_MAX_FRAMES
+            and _GAP_MIN_FRAMES <= gap1 <= _GAP_MAX_FRAMES
+            and _GAP_MIN_FRAMES <= gap2 <= _GAP_MAX_FRAMES
+        )
+
+        if not valid:
+            index += 1
+            continue
+
+        silence_end = find_following_silence(rms_values, r3[2])
+
+        if silence_end is None:
+            index += 1
+            continue
+
+        start_sample = r1[1] * frame_samples
+        end_sample = silence_end * frame_samples
+
+        if matches and start_sample < matches[-1][1]:
+            index += 1
+            continue
+
+        matches.append((start_sample, end_sample))
+
+        log.info(
+            "Confirmed Morse K at %.1f seconds; removing K and silence",
+            start_sample / sample_rate
+        )
+
+        index += 5
+
+    return matches
+
+
+def convert_pcm_to_ulaw(pcm, output_path):
+    """Convert signed 16-bit PCM directly to raw mu-law."""
+    command = [
+        _FFMPEG,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "s16le",
+        "-ar", str(_SAMPLE_RATE),
+        "-ac", "1",
+        "-i", "pipe:0",
+        "-f", "mulaw",
+        "pipe:1"
+    ]
+
+    with open(output_path, "wb") as output:
+        result = subprocess.run(
+            command,
+            input=pcm,
+            stdout=output,
+            stderr=subprocess.PIPE
+        )
+
+    if result.returncode != 0:
+        raise Exception(
+            "FFmpeg ulaw conversion failed: "
+            + result.stderr.decode(errors="replace")
+        )
+
+    os.chmod(output_path, 0o644)
+
+
+def create_ulaw_file(pcm, files, log):
+    """Create a temporary ulaw file from a PCM segment."""
+    temp = tempfile.NamedTemporaryFile(
+        suffix=".ulaw",
+        delete=False
+    )
+
+    path = temp.name
+    temp.close()
+
+    try:
+        convert_pcm_to_ulaw(pcm, path)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+    duration = os.path.getsize(path) / _SAMPLE_RATE
+
+    files.append({"path": path, "duration": duration})
+
+    log.info(
+        "Prepared audio file %d: %.1f seconds",
+        len(files), duration
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download and play Amateur Radio Newsline "
+                    "or ARRL Audio News"
+    )
+
+    parser.add_argument("--node", required=True,
+                        help="AllStar Node number")
+    parser.add_argument("--when",
+                        help="Playback time in 24-hour HHMM format")
+    parser.add_argument("--source", default="arn",
+                        choices=["arn", "aan"],
+                        help="News source: arn or aan")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="play-arn: %(name)s: %(levelname)s: %(message)s"
+    )
+    log = logging.getLogger(__name__)
+
+    try:
+        asterisk_uid = pwd.getpwnam("asterisk").pw_uid
+    except KeyError:
+        sys.exit("Required user 'asterisk' does not exist")
+
+    if os.geteuid() not in (0, asterisk_uid):
+        sys.exit("Run this script as 'asterisk' or 'root'")
+
+    if not re.fullmatch(r"[0-9]{4,6}", args.node):
+        sys.exit("Error: nodes must be four to six digits")
+
+    when = None
+
+    if args.when:
+        if not re.fullmatch(r"[0-9]{4}", args.when):
+            sys.exit("Error: --when must use HHMM format")
+
+        hour, minute = int(args.when[:2]), int(args.when[2:])
+
+        if hour > 23 or minute > 59:
+            sys.exit("Error: Invalid playback time")
+
+        now = datetime.now()
+        when = now.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+
+        if when < now:
+            sys.exit("Error: --when must be in the future")
+
+    if not os.path.isfile(_FFMPEG):
+        sys.exit(
+            f"FFmpeg not found at {_FFMPEG}; update _FFMPEG in the script"
+        )
+
+    news_url = "https://www.arnewsline.org/s/news.mp3"
+
+    if args.source == "aan":
+        news_url = get_aan_url()
+
+    segment_files = []
+
+    try:
+        # Download MP3; decode to PCM in memory without creating WAV.
+        with tempfile.NamedTemporaryFile(suffix=".mp3") as mp3:
+            log.info("Downloading news audio: %s", news_url)
+
+            response = requests.get(news_url, timeout=120)
+            response.raise_for_status()
+
+            mp3.write(response.content)
+            mp3.flush()
+
+            command = [
+                _FFMPEG,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", mp3.name,
+                "-af", "highpass=f=300,lowpass=f=3400",
+                "-ar", str(_SAMPLE_RATE),
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1"
+            ]
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            if result.returncode != 0:
+                raise Exception(
+                    "MP3 decoding failed: "
+                    + result.stderr.decode(errors="replace")
+                )
+
+            pcm = result.stdout
+
+        if not pcm:
+            raise Exception("Decoded audio is empty")
+
+        log.info(
+            "Decoded %.1f seconds of audio",
+            len(pcm) / (2 * _SAMPLE_RATE)
+        )
+
+        markers = find_morse_ks(
+            pcm, _SAMPLE_RATE, _CW_TONE_HZ, log
+        )
+
+        total_samples = len(pcm) // 2
+
+        if not markers:
+            log.warning(
+                "No confirmed Morse K markers found. "
+                "Playing the entire broadcast as one file."
+            )
+            create_ulaw_file(pcm, segment_files, log)
+
+        else:
+            log.info("Confirmed %d marker(s)", len(markers))
+            previous_end = 0
+
+            for start_sample, end_sample in markers:
+                if start_sample > previous_end:
+                    segment_pcm = pcm[
+                        previous_end * 2:start_sample * 2
+                    ]
+
+                    if len(segment_pcm) >= _SAMPLE_RATE:
+                        create_ulaw_file(
+                            segment_pcm, segment_files, log
+                        )
+
+                # Skip the Morse K and the original following silence.
+                previous_end = end_sample
+
+            if previous_end < total_samples:
+                segment_pcm = pcm[previous_end * 2:]
+
+                if len(segment_pcm) >= _SAMPLE_RATE:
+                    create_ulaw_file(
+                        segment_pcm, segment_files, log
+                    )
+
+        del pcm
+
+        if not segment_files:
+            raise Exception("No playable audio segments were produced")
+
+        if when:
+            delay = (when - datetime.now()).total_seconds()
+            if delay > 0:
+                log.info("Waiting %.1f seconds for playback", delay)
+                sleep(delay)
+
+        # Play files in order, with a four-second gap between segments.
+        for index, segment in enumerate(segment_files):
+            path = segment["path"]
+            base_path, _ = os.path.splitext(path)
+
+            command = [
+                "/usr/sbin/asterisk",
+                "-rx",
+                f"rpt playback {args.node} {base_path}"
+            ]
+
+            log.info(
+                "Playing file %d of %d",
+                index + 1, len(segment_files)
+            )
+
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT
+            )
+
+            output = result.stdout.decode(errors="replace").strip()
+
+            if output:
+                log.debug("Asterisk response: %s", output)
+
+            if result.returncode != 0:
+                raise Exception("Asterisk playback failed: " + output)
+
+            # Wait for the file's estimated duration to elapse.
+            sleep(segment["duration"] + 1.0)
+
+            if index < len(segment_files) - 1:
+                log.info("Waiting %d seconds between files", _GAP_SECONDS)
+                sleep(_GAP_SECONDS)
+
+        log.info("All news audio has finished playing")
+
+    finally:
+        for segment in segment_files:
+            try:
+                os.unlink(segment["path"])
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nInterrupted by user")
+    except Exception as exc:
+        sys.exit(f"Error: {exc}")
